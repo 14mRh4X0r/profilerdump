@@ -1,0 +1,8 @@
+{
+  "author": "14mRh4X0r",
+  "description": "Adds a button to the ingame menu to dump profiler results",
+  "mcversion": "${mc_version}",
+  "name": "ProfilerDump",
+  "revision": "0",
+  "version": "${version}"
+}

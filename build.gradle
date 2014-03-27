@@ -1,0 +1,263 @@
+apply plugin: 'java'
+apply plugin: 'idea'
+apply plugin: 'eclipse'
+
+version = "0.1.0"
+archivesBaseName = "profilerdump"
+
+ext.mc_version = "1.6.4"
+
+// Provided configuration {{{1
+configurations { provided; api }
+
+sourceSets {
+  main {
+    compileClasspath += configurations.provided
+  }
+}
+
+idea {
+  module {
+    scopes.PROVIDED.plus += configurations.provided
+  }
+}
+
+eclipse {
+  classpath {
+    plusConfigurations += configurations.provided
+  }
+}
+// }}}1
+
+
+repositories {
+    maven {
+      name = "liteloader"
+      url = "http://dl.liteloader.com/versions/"
+    }
+    maven {
+      name = "minecraft"
+      url = "https://libraries.minecraft.net/"
+    }
+    mavenCentral()
+}
+
+dependencies {
+  api "com.mumfrey:liteloader:${mc_version}"
+  provided "net.minecraft:launchwrapper:1.8"
+}
+
+// Custom tasks {{{1
+import java.io.File
+
+class Download extends DefaultTask {
+  @Input String src
+  @OutputFile File dest
+  @TaskAction void download() {
+    ant.get(src: this.src, dest: this.dest)
+  }
+}
+
+class Reobf extends JavaExec {
+  @InputFile File src
+  @OutputFile File out
+  @Override void exec() {
+    this.main = 'immibis.bon.cui.MCPRemap'
+    this.classpath = project.files(project.tasks.downloadBON.dest)
+    this.args = ['-mcp', project.ext.mcpDir.absolutePath,
+            '-from', 'MCP',
+            '-to',   'OBF',
+            '-side', 'CLIENT',
+            '-ref',  new File(project.ext.mcpDir, 'bin/minecraft').absolutePath,
+            '-in', this.src,
+            '-out', this.out.absolutePath]
+    super.exec()
+  }
+}
+
+// MCP {{{1
+import org.apache.tools.ant.taskdefs.condition.Os
+
+ext.mcpDir = new File(buildDir, 'mcp')
+
+def runMCPTask(String name) {
+  def cmd
+  if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+    cmd = ["cmd", "/c", name + ".bat"]
+  } else {
+    cmd = ["/bin/bash", name + ".sh"]
+  }
+
+  cmd << '--client'
+  cmd << '--nocopy'
+
+  println() // Nice newline for Jenkins
+
+  Process proc = new ProcessBuilder(cmd).directory(mcpDir).start()
+  proc.consumeProcessOutput(System.out, System.err)
+
+  return proc.waitFor()
+}
+
+task getMCP(type: Download) {
+  src = 'http://mcp.ocean-labs.de/files/archive/mcp811.zip'
+  dest = new File(buildDir, 'mcp.zip')
+
+  doLast {
+    def mcpDir = new File(buildDir, 'mcp')
+    ant.unzip src: outputs.files.files.iterator().next(), dest: mcpDir
+  }
+}
+
+// Assets {{{2
+buildscript {
+  repositories {
+    mavenCentral()
+  }
+  dependencies {
+    classpath 'net.sourceforge.argo:argo:3.7'
+  }
+}
+
+import argo.jdom.JdomParser
+
+task getAssets {
+  def jars = mcpDir.absolutePath + '/jars'
+  outputs.dir(jars + '/libraries')
+  outputs.dir(jars + "/versions/${mc_version}")
+
+  doLast {
+    def os = Os.isFamily(Os.FAMILY_WINDOWS) ? "windows" : Os.isFamily(Os.FAMILY_MAC) ? "osx" : "linux"
+    def home = Os.isFamily(Os.FAMILY_WINDOWS) ? System.env['APPDATA'] : System.env['HOME']
+    File mcDir = new File(home, Os.isFamily(Os.FAMILY_MAC) ? 'Library/Application Support/minecraft' : '.minecraft')
+
+    def copyLocally = false
+    File librariesDir
+    if (mcDir.isDirectory()) {
+      File versionDir = new File(mcDir, "versions/${mc_version}")
+      librariesDir = new File(mcDir, 'libraries')
+      if (versionDir.exists() && librariesDir.exists()) {
+        copyLocally = true
+      }
+    }
+
+    File versionDir = new File(jars, 'versions/1.6.4')
+    versionDir.mkdirs()
+
+    ant.get(src: "http://s3.amazonaws.com/Minecraft.Download/versions/${mc_version}/${mc_version}.json",
+            dest: new File(versionDir, "1.6.4.json"))
+    ant.get(src: "http://s3.amazonaws.com/Minecraft.Download/versions/${mc_version}/${mc_version}.jar",
+            dest: new File(versionDir, "1.6.4.jar"))
+
+    def rootNode = new JdomParser().parse(new java.io.File(versionDir, "${mc_version}.json").newReader())
+    rootNode.getArrayNode('libraries').each { node ->
+      if (node.isArrayNode("rules")) { // Weird os-specific dependencies. We're only compiling anyway.
+        def noRet = false
+        node.getArrayNode("rules").each { rule ->
+          if (rule.getStringValue("action").equals("allow") && !rule.isNode("os")) noRet = true
+        }
+        if (!noRet) return
+      }
+
+      def (group, artifact, version) = node.getStringValue('name').split(':')
+      group = group.replace('.', '/')
+      def classifier = node.isNode("natives") ? "-natives-${os}" : ""
+      def path = "${group}/${artifact}/${version}/${artifact}-${version}${classifier}.jar"
+      def dest = new File(buildDir, "mcp/jars/libraries/${path}")
+      dest.parentFile.mkdirs()
+      def nativesDir = new File(versionDir, "${mc_version}-natives")
+      nativesDir.mkdirs()
+      def src = copyLocally ? new File(librariesDir, path).toURI() : "https://libraries.minecraft.net/${path}"
+      ant.get(src: src, dest: dest)
+
+      if (node.isNode("natives")) {
+        ant.unzip(src: dest, dest: nativesDir)
+      }
+    }
+  }
+} // }}}2
+
+task setupMCP(dependsOn: [getMCP, getAssets]) <<{
+  if (!new File(mcpDir, 'src/minecraft').exists()) {
+    runMCPTask('decompile')
+  }
+
+  def binDir = files(new File(mcpDir, 'bin/minecraft'), fileTree(dir: new File(mcpDir, 'jars/libraries')))
+
+  sourceSets.main.compileClasspath += binDir
+  idea.module.scopes.PROVIDED.plus += binDir
+  eclipse.classpath.plusConfigurations += binDir
+}
+
+// BON {{{1
+File deobFile(File obbed) {
+  File deob = new File(obbed.absolutePath + '.deob')
+  javaexec {
+    classpath = files(new File(buildDir, 'BON.jar'))
+    main = 'immibis.bon.cui.MCPRemap'
+    args = ['-mcp', mcpDir.absolutePath,
+            '-from', 'OBF',
+            '-to', 'MCP',
+            '-side', 'CLIENT',
+            '-in', obbed.absolutePath,
+            '-out', deob.absolutePath]
+  }
+
+  return deob
+}
+
+task downloadBON(type: Download) {
+  src = 'http://dl.dropbox.com/u/2944265/mods/BON.jar'
+  dest = new File(buildDir, 'BON.jar')
+}
+
+task deobApiDependencies(dependsOn: [downloadBON, setupMCP, configurations.api]) {
+  inputs.files files(configurations.api)
+  outputs.files files(configurations.api.collect { it.absolutePath + '.deob' })
+
+  doLast {
+    configurations.api.each { File file ->
+      File deob = deobFile(file)
+    }
+  }
+}
+
+task addApiDependenciesToClasspath(dependsOn: deobApiDependencies) {
+  inputs.files deobApiDependencies.outputs.files
+
+  doLast {
+    sourceSets.main.compileClasspath += deobApiDependencies.outputs.files
+    idea.module.scopes.PROVIDED.plus += deobApiDependencies.outputs.files
+    eclipse.classpath.plusConfigurations += deobApiDependencies.outputs.files
+  }
+}
+compileJava.dependsOn addApiDependenciesToClasspath
+// }}}1
+
+processResources {
+  from(sourceSets.main.resources.srcDirs) {
+    include 'litemod.json'
+
+    expand 'version': version, 'mc_version': mc_version
+  }
+
+  from(sourceSets.main.resources.srcDirs) {
+    exclude 'litemod.json'
+  }
+}
+
+compileJava {
+  options.compilerArgs = ["-Xlint:all"]
+}
+
+jar {
+  classifier = 'deob'
+  extension = 'litemod'
+}
+
+task reobf(dependsOn: [tasks.jar, downloadBON, setupMCP], type: Reobf) {
+  src = jar.archivePath
+  out = new File(jar.destinationDir, "${archivesBaseName}-${version}.${jar.extension}")
+}
+
+assemble.dependsOn reobf
